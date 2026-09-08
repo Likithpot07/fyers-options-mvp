@@ -11,3 +11,9 @@ aiohttp==3.9.3
 aws_lambda_powertools==1.25.5
 websocket-client==1.6.1
 setuptools==68.0.0
+
+protobuf
+python-dateutil
+six
+urllib3
+certifi
