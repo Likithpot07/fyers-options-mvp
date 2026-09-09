@@ -1,550 +1,846 @@
 import os
 import time
-from datetime import datetime, timezone, timedelta
+import json
+import math
 from pathlib import Path
-from urllib.parse import quote
+from datetime import datetime, timedelta
 
-import pandas as pd
 import requests
+import pandas as pd
 from dotenv import load_dotenv
 
 
-# --------------------------------------------------
+# ============================================================
 # CONFIG
-# --------------------------------------------------
+# ============================================================
 
 load_dotenv()
 
-IST = timezone(timedelta(hours=5, minutes=30))
-
 ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN")
+
 if not ACCESS_TOKEN:
     raise RuntimeError("UPSTOX_ACCESS_TOKEN is missing from .env")
 
-UNDERLYING = "NSE_INDEX|Nifty 50"
-
-LOOKBACK_DAYS = 30
-STRIKES_EACH_SIDE = 5
-
-OUTPUT_PATH = Path("data/raw/candles_1m.parquet")
-
 API_BASE = "https://api.upstox.com"
 
-HEADERS = {
-    "Accept": "application/json",
-    "Authorization": f"Bearer {ACCESS_TOKEN}",
-}
+UNDERLYING = "NSE_INDEX|Nifty 50"
 
+START_DATE = "2025-08-01"
+END_DATE = "2026-09-01"
 
-# --------------------------------------------------
-# UPSTOX REST HELPER
-# --------------------------------------------------
+STRIKES_EACH_SIDE = 5
 
-def upstox_get(path, params=None, timeout=30):
+RAW_DIR = Path("data/raw")
+CACHE_DIR = RAW_DIR / "historical_cache"
 
-    response = requests.get(
-        f"{API_BASE}{path}",
-        headers=HEADERS,
-        params=params,
-        timeout=timeout,
-    )
+NIFTY_CACHE = CACHE_DIR / "nifty.parquet"
+CONTRACT_CACHE = CACHE_DIR / "contracts.json"
+PROGRESS_FILE = CACHE_DIR / "progress.json"
+OPTIONS_CACHE = CACHE_DIR / "options.parquet"
 
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"Upstox API failed [{response.status_code}] "
-            f"{path}: {response.text}"
-        )
+TEMP_OUTPUT = RAW_DIR / "candles_1m_historical.parquet"
+FINAL_OUTPUT = RAW_DIR / "candles_1m.parquet"
 
-    payload = response.json()
+RAW_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    if payload.get("status") != "success":
-        raise RuntimeError(
-            f"Upstox API error {path}: {payload}"
-        )
 
-    return payload
+# ============================================================
+# RATE LIMITING
+# ============================================================
 
+# Stay comfortably below the documented limits.
+REQUEST_DELAY = 0.45
 
-# --------------------------------------------------
-# DATE RANGE
-# --------------------------------------------------
+# Maximum requests we intentionally make in one rolling window.
+WINDOW_REQUEST_LIMIT = 1800
 
-today = datetime.now(IST)
+WINDOW_SECONDS = 30 * 60
 
-range_to = today.date()
-range_from = (
-    today - timedelta(days=LOOKBACK_DAYS)
-).date()
+request_times = []
 
 
-# --------------------------------------------------
-# GET NIFTY SPOT
-# --------------------------------------------------
+def wait_for_rate_limit():
+    global request_times
 
-spot_payload = upstox_get(
-    "/v3/market-quote/ltp",
-    params={
-        "instrument_key": UNDERLYING
-    }
-)
+    now = time.time()
 
-spot_data = spot_payload.get("data", {})
-
-if not spot_data:
-    raise RuntimeError(
-        f"No NIFTY LTP returned: {spot_payload}"
-    )
-
-spot_row = next(
-    iter(
-        spot_data.values()
-    )
-)
-
-spot = float(
-    spot_row["last_price"]
-)
-
-print("NIFTY:", spot)
-
-
-# --------------------------------------------------
-# GET OPTION CONTRACTS
-# --------------------------------------------------
-
-contracts_payload = upstox_get(
-    "/v2/option/contract",
-    params={
-        "instrument_key": UNDERLYING
-    }
-)
-
-contracts = contracts_payload.get(
-    "data",
-    []
-)
-
-if not contracts:
-    raise RuntimeError(
-        "Upstox returned no NIFTY option contracts."
-    )
-
-
-# --------------------------------------------------
-# CURRENT / NEAREST EXPIRY
-# --------------------------------------------------
-
-today_date = today.date()
-
-future_contracts = []
-
-for contract in contracts:
-
-    expiry_text = contract.get(
-        "expiry"
-    )
-
-    if not expiry_text:
-        continue
-
-    expiry_date = datetime.strptime(
-        expiry_text,
-        "%Y-%m-%d"
-    ).date()
-
-    if expiry_date >= today_date:
-
-        future_contracts.append(
-            contract
-        )
-
-
-if not future_contracts:
-    raise RuntimeError(
-        "No non-expired NIFTY option contracts found."
-    )
-
-
-nearest_expiry = min(
-    datetime.strptime(
-        contract["expiry"],
-        "%Y-%m-%d"
-    ).date()
-    for contract in future_contracts
-)
-
-
-expiry_contracts = [
-    contract
-    for contract in future_contracts
-    if datetime.strptime(
-        contract["expiry"],
-        "%Y-%m-%d"
-    ).date() == nearest_expiry
-]
-
-
-print(
-    "Current expiry:",
-    nearest_expiry
-)
-
-
-# Store expiry as actual market expiry time:
-# 15:30 IST on expiry day.
-expiry_ist = datetime(
-    year=nearest_expiry.year,
-    month=nearest_expiry.month,
-    day=nearest_expiry.day,
-    hour=15,
-    minute=30,
-    second=0,
-    tzinfo=IST,
-)
-
-EXPIRY = pd.Timestamp(
-    expiry_ist.astimezone(
-        timezone.utc
-    )
-)
-
-
-# --------------------------------------------------
-# FIND AVAILABLE STRIKES
-# --------------------------------------------------
-
-by_strike = {}
-
-for contract in expiry_contracts:
-
-    option_type = contract.get(
-        "instrument_type"
-    )
-
-    strike = contract.get(
-        "strike_price"
-    )
-
-    if (
-        option_type not in ("CE", "PE")
-        or strike is None
-    ):
-        continue
-
-    strike = float(
-        strike
-    )
-
-    by_strike.setdefault(
-        strike,
-        {}
-    )[option_type] = contract
-
-
-# Only use strikes where both CE and PE exist.
-strikes = sorted(
-    strike
-    for strike, pair in by_strike.items()
-    if "CE" in pair and "PE" in pair
-)
-
-
-if not strikes:
-    raise RuntimeError(
-        "Could not find matching CE/PE strikes."
-    )
-
-
-atm_strike = min(
-    strikes,
-    key=lambda strike: abs(
-        strike - spot
-    )
-)
-
-print(
-    "ATM:",
-    atm_strike
-)
-
-
-atm_index = strikes.index(
-    atm_strike
-)
-
-start = max(
-    0,
-    atm_index - STRIKES_EACH_SIDE
-)
-
-end = (
-    atm_index
-    + STRIKES_EACH_SIDE
-    + 1
-)
-
-selected_strikes = strikes[
-    start:end
-]
-
-print(
-    "Selected strikes:",
-    selected_strikes
-)
-
-
-# --------------------------------------------------
-# SYMBOLS WE WANT
-# --------------------------------------------------
-
-symbols = [
-    {
-        "symbol": UNDERLYING,
-        "type": "INDEX",
-        "strike": None,
-        "expiry": pd.NaT,
-    }
-]
-
-
-for strike in selected_strikes:
-
-    pair = by_strike[
-        strike
+    # Remove requests outside the rolling window.
+    request_times = [
+        t for t in request_times
+        if now - t < WINDOW_SECONDS
     ]
 
-    for option_type in (
-        "CE",
-        "PE"
-    ):
+    if len(request_times) >= WINDOW_REQUEST_LIMIT:
+        oldest = min(request_times)
+        wait_seconds = WINDOW_SECONDS - (now - oldest) + 5
 
-        contract = pair[
-            option_type
+        print(
+            f"\nRate-limit safety pause: waiting "
+            f"{wait_seconds / 60:.1f} minutes..."
+        )
+
+        time.sleep(max(wait_seconds, 1))
+
+        now = time.time()
+
+        request_times = [
+            t for t in request_times
+            if now - t < WINDOW_SECONDS
         ]
 
-        symbols.append(
-            {
-                "symbol": contract[
-                    "instrument_key"
-                ],
-                "trading_symbol": contract.get(
-                    "trading_symbol",
-                    contract["instrument_key"],
-                ),
-                "type": option_type,
-                "strike": strike,
-                "expiry": EXPIRY,
-            }
+    if request_times:
+        elapsed = now - request_times[-1]
+
+        if elapsed < REQUEST_DELAY:
+            time.sleep(REQUEST_DELAY - elapsed)
+
+    request_times.append(time.time())
+
+
+# ============================================================
+# HTTP
+# ============================================================
+
+session = requests.Session()
+
+session.headers.update({
+    "Authorization": f"Bearer {ACCESS_TOKEN}",
+    "Accept": "application/json",
+})
+
+
+def upstox_get(path, max_retries=8):
+    """
+    GET with proper 429 handling.
+
+    429:
+      wait progressively, then retry.
+
+    5xx:
+      retry.
+
+    4xx other than 429:
+      fail immediately.
+    """
+
+    url = API_BASE + path
+
+    for attempt in range(max_retries):
+        wait_for_rate_limit()
+
+        response = session.get(url, timeout=60)
+
+        if response.status_code == 200:
+            return response.json()
+
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After")
+
+            if retry_after:
+                try:
+                    wait = float(retry_after)
+                except ValueError:
+                    wait = 30
+            else:
+                wait = min(60 * (attempt + 1), 300)
+
+            print(
+                f"  HTTP 429; rate limit reached. "
+                f"Waiting {wait:.0f}s before retry "
+                f"{attempt + 1}/{max_retries}..."
+            )
+
+            time.sleep(wait)
+            continue
+
+        if 500 <= response.status_code < 600:
+            wait = min(5 * (2 ** attempt), 120)
+
+            print(
+                f"  HTTP {response.status_code}; "
+                f"retrying in {wait}s..."
+            )
+
+            time.sleep(wait)
+            continue
+
+        raise RuntimeError(
+            f"Upstox API HTTP {response.status_code}: "
+            f"{response.text[:1000]}"
         )
 
+    raise RuntimeError(
+        f"Upstox API failed after {max_retries} retries: {path}"
+    )
 
-print(
-    f"\nFetching {len(symbols)} instruments...\n"
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def load_json(path):
+    if not path.exists():
+        return None
+
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def save_json(path, obj):
+    tmp = path.with_suffix(".tmp")
+
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2)
+
+    tmp.replace(path)
+
+
+def parse_candles(payload):
+    candles = (
+        payload
+        .get("data", {})
+        .get("candles", [])
+    )
+
+    rows = []
+
+    for candle in candles:
+        if len(candle) < 7:
+            continue
+
+        rows.append({
+            "timestamp": candle[0],
+            "open": candle[1],
+            "high": candle[2],
+            "low": candle[3],
+            "close": candle[4],
+            "volume": candle[5],
+            "open_interest": candle[6],
+        })
+
+    return rows
+
+
+# ============================================================
+# HISTORICAL EXPIRIES
+# ============================================================
+
+print("=" * 70)
+print("HISTORICAL NIFTY OPTIONS DATA REBUILD")
+print("=" * 70)
+
+print(f"Date range: {START_DATE} -> {END_DATE}")
+print(f"Underlying: {UNDERLYING}")
+print()
+
+
+print("Fetching historical expiry dates...")
+
+expiry_path = (
+    "/v2/expired-instruments/expiries"
+    f"?instrument_key={UNDERLYING}"
 )
 
+expiry_payload = upstox_get(expiry_path)
 
-# --------------------------------------------------
-# FETCH HISTORY
-# --------------------------------------------------
+expiry_dates = expiry_payload.get("data", [])
 
-all_frames = []
+if not expiry_dates:
+    raise RuntimeError("No historical expiry dates returned.")
+
+expiry_dates = sorted(
+    str(x)[:10]
+    for x in expiry_dates
+)
+
+expiry_dates = [
+    x for x in expiry_dates
+    if START_DATE <= x <= END_DATE
+]
+
+if not expiry_dates:
+    raise RuntimeError("No expiry dates inside requested range.")
+
+print(f"Historical expiries: {len(expiry_dates)}")
+print(f"First expiry: {expiry_dates[0]}")
+print(f"Last expiry:  {expiry_dates[-1]}")
+print()
 
 
-for instrument in symbols:
+# ============================================================
+# CONTRACT METADATA
+# ============================================================
 
-    symbol = instrument[
-        "symbol"
+contracts_cache = load_json(CONTRACT_CACHE)
+
+if contracts_cache is None:
+    contracts_cache = {}
+
+print("Loading historical option contracts...")
+
+for expiry in expiry_dates:
+
+    if expiry in contracts_cache:
+        continue
+
+    print(f"  Contracts: {expiry}")
+
+    path = (
+        "/v2/expired-instruments/option/contract"
+        f"?instrument_key={UNDERLYING}"
+        f"&expiry_date={expiry}"
+    )
+
+    payload = upstox_get(path)
+
+    data = payload.get("data", [])
+
+    contracts_cache[expiry] = data
+
+    save_json(CONTRACT_CACHE, contracts_cache)
+
+    print(f"    {len(data)} contracts")
+
+
+print()
+print("Contract metadata ready.")
+
+
+# ============================================================
+# NIFTY HISTORICAL DATA
+# ============================================================
+
+def fetch_nifty_day(date_str):
+
+    path = (
+        f"/v3/historical-candle/"
+        f"{UNDERLYING}/minutes/1/"
+        f"{date_str}/{date_str}"
+    )
+
+    payload = upstox_get(path)
+
+    rows = parse_candles(payload)
+
+    for row in rows:
+        row["timestamp"] = pd.to_datetime(
+            row["timestamp"],
+            utc=True
+        )
+
+    return rows
+
+
+if NIFTY_CACHE.exists():
+
+    print("Loading cached NIFTY candles...")
+
+    nifty_df = pd.read_parquet(NIFTY_CACHE)
+
+else:
+
+    print()
+    print("Downloading historical NIFTY 1-minute candles...")
+    print("This creates the trading-day calendar used by the option rebuild.")
+
+    current = pd.Timestamp(START_DATE)
+    end = pd.Timestamp(END_DATE)
+
+    nifty_rows = []
+
+    while current <= end:
+
+        date_str = current.strftime("%Y-%m-%d")
+
+        # Weekends can be skipped without making an API request.
+        if current.weekday() < 5:
+
+            try:
+                rows = fetch_nifty_day(date_str)
+
+                if rows:
+                    nifty_rows.extend(rows)
+
+                    print(
+                        f"  NIFTY {date_str}: "
+                        f"{len(rows)} candles"
+                    )
+
+            except Exception as exc:
+                print(
+                    f"  NIFTY {date_str} FAILED: {exc}"
+                )
+
+        current += pd.Timedelta(days=1)
+
+    nifty_df = pd.DataFrame(nifty_rows)
+
+    if nifty_df.empty:
+        raise RuntimeError("No NIFTY historical candles downloaded.")
+
+    nifty_df["timestamp"] = pd.to_datetime(
+        nifty_df["timestamp"],
+        utc=True
+    )
+
+    nifty_df = (
+        nifty_df
+        .drop_duplicates("timestamp")
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+
+    nifty_df.to_parquet(NIFTY_CACHE, index=False)
+
+print()
+print(f"NIFTY candles: {len(nifty_df):,}")
+
+
+# ============================================================
+# TRADING DAYS
+# ============================================================
+
+nifty_df["date"] = (
+    nifty_df["timestamp"]
+    .dt.tz_convert("Asia/Kolkata")
+    .dt.strftime("%Y-%m-%d")
+)
+
+daily_nifty = (
+    nifty_df
+    .sort_values("timestamp")
+    .groupby("date", as_index=False)
+    .first()
+)
+
+trading_days = sorted(daily_nifty["date"].tolist())
+
+print(f"Trading days: {len(trading_days)}")
+
+
+# ============================================================
+# EXPIRY SELECTION
+# ============================================================
+
+def nearest_expiry_for_day(date_str):
+
+    valid = [
+        expiry
+        for expiry in expiry_dates
+        if expiry >= date_str
     ]
 
-    trading_symbol = instrument.get(
-        "trading_symbol",
-        symbol
+    if not valid:
+        return None
+
+    return min(valid)
+
+
+# ============================================================
+# OPTION UNIVERSE
+# ============================================================
+
+def build_daily_universe(date_str, nifty_open):
+
+    expiry = nearest_expiry_for_day(date_str)
+
+    if expiry is None:
+        return []
+
+    contracts = contracts_cache.get(expiry, [])
+
+    if not contracts:
+        return []
+
+    usable = []
+
+    for contract in contracts:
+
+        instrument_key = contract.get("instrument_key")
+        strike = contract.get("strike_price")
+        option_type = contract.get("instrument_type")
+
+        if (
+            instrument_key is None
+            or strike is None
+            or option_type not in ("CE", "PE")
+        ):
+            continue
+
+        usable.append({
+            "instrument_key": instrument_key,
+            "strike": float(strike),
+            "option_type": option_type,
+            "expiry": expiry,
+            "trading_symbol": contract.get(
+                "trading_symbol",
+                ""
+            ),
+        })
+
+    if not usable:
+        return []
+
+    strikes = sorted({
+        x["strike"]
+        for x in usable
+    })
+
+    # Find the closest available strike to the first
+    # NIFTY candle OPEN. This avoids using the 09:15 close.
+    atm_strike = min(
+        strikes,
+        key=lambda s: abs(s - float(nifty_open))
     )
+
+    selected_strikes = sorted(
+        strikes,
+        key=lambda s: abs(s - atm_strike)
+    )[:(STRIKES_EACH_SIDE * 2 + 1)]
+
+    selected_strikes = set(selected_strikes)
+
+    universe = [
+        x for x in usable
+        if x["strike"] in selected_strikes
+    ]
+
+    # Keep only strikes for which BOTH CE and PE exist.
+    strike_types = {}
+
+    for x in universe:
+        strike_types.setdefault(
+            x["strike"],
+            set()
+        ).add(x["option_type"])
+
+    valid_strikes = {
+        strike
+        for strike, types in strike_types.items()
+        if {"CE", "PE"}.issubset(types)
+    }
+
+    universe = [
+        x for x in universe
+        if x["strike"] in valid_strikes
+    ]
+
+    return universe
+
+
+# ============================================================
+# BUILD REQUEST QUEUE
+# ============================================================
+
+print()
+print("Building option download queue...")
+
+requests_queue = []
+
+for _, row in daily_nifty.iterrows():
+
+    date_str = row["date"]
+
+    # IMPORTANT:
+    # first candle OPEN is used for ATM.
+    nifty_open = row["open"]
+
+    universe = build_daily_universe(
+        date_str,
+        nifty_open
+    )
+
+    for contract in universe:
+
+        requests_queue.append({
+            "date": date_str,
+            "expiry": contract["expiry"],
+            "instrument_key": contract["instrument_key"],
+            "strike": contract["strike"],
+            "option_type": contract["option_type"],
+            "trading_symbol": contract["trading_symbol"],
+        })
+
+
+print(f"Option requests: {len(requests_queue):,}")
+
+
+# ============================================================
+# RESUME STATE
+# ============================================================
+
+progress = load_json(PROGRESS_FILE)
+
+if progress is None:
+    progress = {
+        "completed": {},
+        "failed": {},
+    }
+
+completed = progress.setdefault("completed", {})
+failed = progress.setdefault("failed", {})
+
+print(f"Previously completed: {len(completed):,}")
+print(f"Previously failed:    {len(failed):,}")
+
+remaining = [
+    x for x in requests_queue
+    if (
+        f"{x['date']}|{x['instrument_key']}"
+        not in completed
+    )
+]
+
+print(f"Remaining:             {len(remaining):,}")
+print()
+
+
+# ============================================================
+# EXISTING OPTION CACHE
+# ============================================================
+
+if OPTIONS_CACHE.exists():
+    print("Loading existing option cache...")
+    option_cache_df = pd.read_parquet(OPTIONS_CACHE)
+else:
+    option_cache_df = pd.DataFrame()
+
+
+# ============================================================
+# DOWNLOAD OPTIONS
+# ============================================================
+
+new_rows = []
+
+total = len(requests_queue)
+
+completed_count = len(completed)
+
+print("=" * 70)
+print("DOWNLOADING OPTION CANDLES")
+print("=" * 70)
+
+for item in remaining:
+
+    completed_count += 1
+
+    date_str = item["date"]
+    instrument_key = item["instrument_key"]
+
+    cache_key = f"{date_str}|{instrument_key}"
 
     print(
-        "Fetching:",
-        trading_symbol
+        f"[{completed_count}/{total}] "
+        f"{item['trading_symbol']} | {date_str}"
     )
 
-    encoded_symbol = quote(
-        symbol,
+    encoded_key = requests.utils.quote(
+        instrument_key,
         safe=""
     )
 
     path = (
-        f"/v3/historical-candle/"
-        f"{encoded_symbol}/minutes/1/"
-        f"{range_to.strftime('%Y-%m-%d')}/"
-        f"{range_from.strftime('%Y-%m-%d')}"
+        f"/v2/expired-instruments/"
+        f"historical-candle/"
+        f"{encoded_key}/1minute/"
+        f"{date_str}/{date_str}"
     )
 
     try:
 
-        payload = upstox_get(
-            path
-        )
+        payload = upstox_get(path)
+
+        rows = parse_candles(payload)
+
+        for row in rows:
+
+            row.update({
+                "timestamp": pd.to_datetime(
+                    row["timestamp"],
+                    utc=True
+                ),
+                "symbol": instrument_key,
+                "instrument_type": item["option_type"],
+                "strike": item["strike"],
+                "expiry": item["expiry"],
+            })
+
+            new_rows.append(row)
+
+        completed[cache_key] = {
+            "rows": len(rows),
+            "date": date_str,
+            "instrument_key": instrument_key,
+        }
+
+        failed.pop(cache_key, None)
 
     except Exception as exc:
 
+        print(f"  FAILED: {exc}")
+
+        failed[cache_key] = str(exc)
+
+    # Checkpoint frequently.
+    if (
+        len(new_rows) >= 25
+        or completed_count % 25 == 0
+    ):
+
+        if new_rows:
+
+            chunk = pd.DataFrame(new_rows)
+
+            if option_cache_df.empty:
+                option_cache_df = chunk
+            else:
+                option_cache_df = pd.concat(
+                    [option_cache_df, chunk],
+                    ignore_index=True
+                )
+
+            new_rows = []
+
+            option_cache_df = (
+                option_cache_df
+                .drop_duplicates(
+                    subset=[
+                        "timestamp",
+                        "symbol",
+                    ]
+                )
+                .sort_values(
+                    ["timestamp", "symbol"]
+                )
+                .reset_index(drop=True)
+            )
+
+            option_cache_df.to_parquet(
+                OPTIONS_CACHE,
+                index=False
+            )
+
+        save_json(
+            PROGRESS_FILE,
+            progress
+        )
+
         print(
-            "  SKIPPED:",
-            exc
+            f"  CHECKPOINT: "
+            f"{len(completed):,} completed | "
+            f"{len(failed):,} failed"
         )
 
-        continue
 
+# Final checkpoint.
 
-    candles = (
-        payload
-        .get(
-            "data",
-            {}
-        )
-        .get(
-            "candles",
-            []
-        )
-    )
+if new_rows:
 
+    chunk = pd.DataFrame(new_rows)
 
-    if not candles:
-
-        print(
-            "  No candles"
+    if option_cache_df.empty:
+        option_cache_df = chunk
+    else:
+        option_cache_df = pd.concat(
+            [option_cache_df, chunk],
+            ignore_index=True
         )
 
-        continue
+    option_cache_df = (
+        option_cache_df
+        .drop_duplicates(
+            subset=[
+                "timestamp",
+                "symbol",
+            ]
+        )
+        .sort_values(
+            ["timestamp", "symbol"]
+        )
+        .reset_index(drop=True)
+    )
+
+    option_cache_df.to_parquet(
+        OPTIONS_CACHE,
+        index=False
+    )
+
+save_json(
+    PROGRESS_FILE,
+    progress
+)
 
 
-    # Upstox V3 candle format:
-    # [
-    #   timestamp,
-    #   open,
-    #   high,
-    #   low,
-    #   close,
-    #   volume,
-    #   open_interest
-    # ]
-    normalized_rows = [
-        row[:7]
-        for row in candles
-        if len(row) >= 7
-    ]
+# ============================================================
+# BUILD FINAL RAW DATASET
+# ============================================================
 
+print()
+print("=" * 70)
+print("BUILDING FINAL RAW DATASET")
+print("=" * 70)
 
-    df = pd.DataFrame(
-        normalized_rows,
-        columns=[
-            "timestamp",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "open_interest",
-        ]
+if option_cache_df.empty:
+    raise RuntimeError(
+        "Option cache is empty. No historical option data was downloaded."
     )
 
 
-    # Keep canonical timestamp in UTC.
-    df["timestamp"] = pd.to_datetime(
-        df["timestamp"],
-        utc=True,
-        errors="coerce",
-    )
+# NIFTY INDEX rows.
+
+index_df = nifty_df.copy()
+
+index_df["symbol"] = UNDERLYING
+index_df["instrument_type"] = "INDEX"
+index_df["strike"] = math.nan
+index_df["expiry"] = None
 
 
-    df = df.dropna(
-        subset=[
-            "timestamp"
-        ]
-    )
+# Normalize option schema.
+
+option_df = option_cache_df.copy()
+
+option_df["instrument_type"] = (
+    option_df["instrument_type"]
+    .astype(str)
+    .str.upper()
+)
+
+# Keep only actual option rows.
+option_df = option_df[
+    option_df["instrument_type"].isin(["CE", "PE"])
+].copy()
 
 
-    # Preserve the old timestamp_epoch column
-    # so downstream code/schema remains compatible.
-    df["timestamp_epoch"] = (
-        df["timestamp"]
-        .astype("int64")
-        // 1_000_000_000
-    )
+columns = [
+    "timestamp",
+    "symbol",
+    "instrument_type",
+    "strike",
+    "expiry",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "open_interest",
+]
 
 
-    df["symbol"] = symbol
-
-    df["instrument_type"] = instrument[
-        "type"
-    ]
-
-    df["strike"] = instrument[
-        "strike"
-    ]
-
-    df["expiry"] = instrument[
-        "expiry"
-    ]
-
-
-    all_frames.append(
-        df
-    )
-
-
-    print(
-        f"  {len(df)} candles"
-    )
-
-
-    # Small delay so we don't hammer Upstox.
-    time.sleep(
-        0.2
-    )
-
-
-# --------------------------------------------------
-# COMBINE
-# --------------------------------------------------
-
-if not all_frames:
-
-    print(
-        "No data fetched."
-    )
-
-    raise SystemExit
+index_df = index_df[columns]
+option_df = option_df[columns]
 
 
 final_df = pd.concat(
-    all_frames,
+    [index_df, option_df],
     ignore_index=True
 )
 
-
-# Ensure expiry remains timezone-aware UTC.
-final_df["expiry"] = pd.to_datetime(
-    final_df["expiry"],
-    utc=True,
-    errors="coerce",
+final_df["timestamp"] = pd.to_datetime(
+    final_df["timestamp"],
+    utc=True
 )
-
-
-final_df = final_df[
-    [
-        "timestamp",
-        "timestamp_epoch",
-        "symbol",
-        "instrument_type",
-        "strike",
-        "expiry",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-    ]
-]
-
 
 final_df = (
     final_df
@@ -552,78 +848,110 @@ final_df = (
         subset=[
             "timestamp",
             "symbol",
-        ],
-        keep="last",
-    )
-    .sort_values(
-        [
-            "timestamp",
-            "symbol",
         ]
     )
-    .reset_index(
-        drop=True
+    .sort_values(
+        ["timestamp", "instrument_type", "symbol"]
     )
+    .reset_index(drop=True)
 )
 
 
-# --------------------------------------------------
-# SAVE PARQUET
-# --------------------------------------------------
+# ============================================================
+# VALIDATION
+# ============================================================
 
-OUTPUT_PATH.parent.mkdir(
-    parents=True,
-    exist_ok=True
+print()
+print("VALIDATION")
+print("-" * 70)
+
+print(
+    f"Total rows:       {len(final_df):,}"
+)
+
+print(
+    f"INDEX rows:       "
+    f"{(final_df['instrument_type'] == 'INDEX').sum():,}"
+)
+
+print(
+    f"CE rows:          "
+    f"{(final_df['instrument_type'] == 'CE').sum():,}"
+)
+
+print(
+    f"PE rows:          "
+    f"{(final_df['instrument_type'] == 'PE').sum():,}"
+)
+
+print(
+    f"Unique symbols:   "
+    f"{final_df['symbol'].nunique():,}"
+)
+
+print(
+    f"Date range:       "
+    f"{final_df['timestamp'].min()} "
+    f"-> "
+    f"{final_df['timestamp'].max()}"
+)
+
+print(
+    f"Completed requests: {len(completed):,}"
+)
+
+print(
+    f"Failed requests:    {len(failed):,}"
 )
 
 
+if failed:
+    print()
+    print(
+        "WARNING: Some requests failed. "
+        "The cache is preserved and the script can be rerun."
+    )
+
+
+# Write temporary output first.
 final_df.to_parquet(
-    OUTPUT_PATH,
+    TEMP_OUTPUT,
     index=False
 )
 
-
+print()
+print(f"Temporary output written:")
+print(f"  {TEMP_OUTPUT}")
 print(
-    "\n----------------------------"
+    f"  Size: {TEMP_OUTPUT.stat().st_size / (1024 * 1024):.1f} MB"
 )
 
-print(
-    "DATA FETCH COMPLETE"
-)
 
-print(
-    "----------------------------"
-)
+# ============================================================
+# ONLY REPLACE FINAL FILE WHEN DOWNLOAD IS COMPLETE
+# ============================================================
 
-print(
-    "Rows:",
-    len(final_df)
-)
+if not failed:
 
-print(
-    "Symbols:",
-    final_df["symbol"].nunique()
-)
+    final_df.to_parquet(
+        FINAL_OUTPUT,
+        index=False
+    )
 
-print(
-    "From:",
-    final_df["timestamp"].min()
-)
+    print()
+    print("=" * 70)
+    print("HISTORICAL REBUILD COMPLETE")
+    print("=" * 70)
+    print(f"Final file: {FINAL_OUTPUT}")
 
-print(
-    "To:",
-    final_df["timestamp"].max()
-)
+else:
 
-print(
-    "Option expiry:",
-    EXPIRY
-)
-
-print(
-    "\nSaved:"
-)
-
-print(
-    OUTPUT_PATH
-)
+    print()
+    print("=" * 70)
+    print("DOWNLOAD INCOMPLETE — ORIGINAL RAW FILE PRESERVED")
+    print("=" * 70)
+    print()
+    print(
+        "Run this script again later. "
+        "It will resume from the cache."
+    )

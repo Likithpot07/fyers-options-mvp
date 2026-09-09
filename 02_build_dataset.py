@@ -14,8 +14,8 @@ from technical_features import build_features
 INPUT_PATH = Path("data/raw/candles_1m.parquet")
 OUTPUT_PATH = Path("data/processed/training_dataset.parquet")
 
-TARGET_PCT = 0.10
-STOP_PCT = 0.10
+TARGET_PCT = 0.05
+STOP_PCT = 0.05
 MAX_HOLD_MINUTES = 30
 
 NANOSECONDS_PER_MINUTE = 60 * 1_000_000_000
@@ -80,7 +80,7 @@ print(
 # Signal = current candle close
 # Entry  = next candle open
 #
-# TARGET  = +10%
+# TARGET  = +5%
 # STOP    = -5%
 # TIMEOUT = neither within 30 real minutes
 # --------------------------------------------------
@@ -559,7 +559,7 @@ hits = int(
 total = len(dataset)
 
 print(
-    "\nSuccessful +10% trades:",
+    "\nSuccessful +5% trades:",
     hits
 )
 

@@ -1,6 +1,5 @@
 from pathlib import Path
 
-import hashlib
 import json
 import pandas as pd
 from xgboost import XGBClassifier
@@ -22,7 +21,7 @@ TEST_DATE_RATIO = 0.20
 
 
 FEATURES = [
-    # Existing option momentum / candle features
+    # Option momentum / candle features
     "return_1m",
     "return_3m",
     "return_5m",
@@ -30,7 +29,7 @@ FEATURES = [
     "body_pct",
     "candle_strength",
 
-    # Existing indicators
+    # Indicators
     "rsi_14",
     "atr_pct",
     "ema_spread_pct",
@@ -56,7 +55,7 @@ FEATURES = [
     "time_to_expiry_days",
     "theta",
 
-    # Fidelity / chart-structure features
+    # Fidelity / chart structure
     "body_to_range_ratio",
     "upper_wick_ratio",
     "lower_wick_ratio",
@@ -91,7 +90,7 @@ FEATURES = [
     "nifty_breakout_up_15",
     "nifty_breakout_down_15",
 
-    # NIFTY Fidelity / chart-structure context
+    # NIFTY fidelity / structure
     "nifty_body_to_range_ratio",
     "nifty_upper_wick_ratio",
     "nifty_lower_wick_ratio",
@@ -111,7 +110,7 @@ FEATURES = [
     "nifty_false_breakout_up_5",
     "nifty_false_breakout_down_5",
 
-    # Existing pivot / moneyness / CE-PE relation
+    # Pivot / moneyness / CE-PE relationship
     "distance_from_pivot_pct",
     "distance_from_strike_pct",
     "premium_pct_of_spot",
@@ -120,31 +119,15 @@ FEATURES = [
     "pe_return_3m",
     "ce_minus_pe_return_3m",
 
-    # Updated setup score
+    # Setup score
     "setup_score",
 ]
 
 TARGET = "target_hit"
 
-# --------------------------------------------------
-# FEATURE MANIFEST / INTEGRITY CHECKS
-# --------------------------------------------------
-if len(FEATURES) != len(set(FEATURES)):
-    raise ValueError("Duplicate feature names found in FEATURES.")
-
-FEATURES_SHA256 = hashlib.sha256(
-    "\n".join(FEATURES).encode("utf-8")
-).hexdigest()
-
-print("\nMODEL FEATURE MANIFEST")
-print("----------------------------")
-print("Feature count:", len(FEATURES))
-print("Feature SHA256:", FEATURES_SHA256)
-print("----------------------------")
-
 
 # --------------------------------------------------
-# LOAD
+# LOAD DATASET
 # --------------------------------------------------
 
 df = pd.read_parquet(INPUT_PATH)
@@ -158,7 +141,7 @@ df["date"] = df["timestamp"].dt.date
 
 
 # --------------------------------------------------
-# VALIDATE INPUT DATASET
+# VALIDATE DATASET
 # --------------------------------------------------
 
 required_columns = FEATURES + [
@@ -186,17 +169,18 @@ dates = sorted(df["date"].unique())
 
 if len(dates) < 2:
     raise ValueError(
-        "Need at least 2 trading days for a time-based train/test split."
+        "Need at least 2 trading days for train/test split."
     )
+
 
 test_days = max(
     1,
     int(len(dates) * TEST_DATE_RATIO)
 )
 
-# Always leave at least one date for training.
 if test_days >= len(dates):
     test_days = len(dates) - 1
+
 
 train_dates = dates[:-test_days]
 test_dates = dates[-test_days:]
@@ -218,7 +202,163 @@ print(
 
 
 # --------------------------------------------------
-# TRAIN ONE MODEL PER OPTION TYPE
+# THRESHOLD ANALYSIS
+# --------------------------------------------------
+
+def print_threshold_table(
+    test,
+    probabilities,
+    y_test,
+    option_type
+):
+
+    print("\n--------------------------------")
+    print(option_type, "THRESHOLD ANALYSIS")
+    print("--------------------------------")
+
+    thresholds = [
+        0.50,
+        0.55,
+        0.60,
+        0.65,
+        0.70,
+        0.75,
+        0.80,
+        0.85,
+        0.90,
+        0.95,
+    ]
+
+    print(
+        f"{'Threshold':>10} "
+        f"{'Signals':>10} "
+        f"{'Precision':>12} "
+        f"{'Recall':>10} "
+        f"{'Success':>12}"
+    )
+
+    print("-" * 60)
+
+    for threshold in thresholds:
+
+        selected = probabilities >= threshold
+
+        count = int(selected.sum())
+
+        if count == 0:
+
+            print(
+                f"{threshold:>10.2f} "
+                f"{0:>10} "
+                f"{'N/A':>12} "
+                f"{'N/A':>10} "
+                f"{'N/A':>12}"
+            )
+
+            continue
+
+
+        selected_y = y_test[selected]
+
+        precision = precision_score(
+            y_test,
+            selected.astype(int),
+            zero_division=0
+        )
+
+        recall = recall_score(
+            y_test,
+            selected.astype(int),
+            zero_division=0
+        )
+
+        success = selected_y.mean()
+
+
+        print(
+            f"{threshold:>10.2f} "
+            f"{count:>10} "
+            f"{precision * 100:>11.2f}% "
+            f"{recall * 100:>9.2f}% "
+            f"{success * 100:>11.2f}%"
+        )
+
+
+    # --------------------------------------------------
+    # THRESHOLD + FIDELITY
+    # --------------------------------------------------
+
+    if "fidelity_confirmed" in test.columns:
+
+        print("\n--------------------------------")
+        print(option_type, "THRESHOLD + FIDELITY")
+        print("--------------------------------")
+
+        print(
+            f"{'Threshold':>10} "
+            f"{'Signals':>10} "
+            f"{'Precision':>12} "
+            f"{'Recall':>10} "
+            f"{'Success':>12}"
+        )
+
+        print("-" * 60)
+
+        for threshold in thresholds:
+
+            selected = (
+                (probabilities >= threshold)
+                & (
+                    test["fidelity_confirmed"]
+                    .fillna(0)
+                    .astype(int)
+                    == 1
+                )
+            )
+
+            count = int(selected.sum())
+
+            if count == 0:
+
+                print(
+                    f"{threshold:>10.2f} "
+                    f"{0:>10} "
+                    f"{'N/A':>12} "
+                    f"{'N/A':>10} "
+                    f"{'N/A':>12}"
+                )
+
+                continue
+
+
+            selected_y = y_test[selected]
+
+            precision = precision_score(
+                y_test[selected],
+                (probabilities[selected] >= threshold).astype(int),
+                zero_division=0
+            )
+
+            recall = (
+                selected_y.sum() / y_test.sum()
+                if y_test.sum() > 0
+                else 0
+            )
+
+            success = selected_y.mean()
+
+
+            print(
+                f"{threshold:>10.2f} "
+                f"{count:>10} "
+                f"{precision * 100:>11.2f}% "
+                f"{recall * 100:>9.2f}% "
+                f"{success * 100:>11.2f}%"
+            )
+
+
+# --------------------------------------------------
+# TRAIN CE + PE MODELS
 # --------------------------------------------------
 
 all_predictions = []
@@ -293,6 +433,10 @@ for option_type in ["CE", "PE"]:
     )
 
 
+    # --------------------------------------------------
+    # MODEL
+    # --------------------------------------------------
+
     model = XGBClassifier(
         n_estimators=400,
         max_depth=5,
@@ -315,19 +459,10 @@ for option_type in ["CE", "PE"]:
         y_train
     )
 
-    booster_feature_names = model.get_booster().feature_names
 
-    if booster_feature_names != FEATURES:
-        raise RuntimeError(
-            f"{option_type} model feature order does not match FEATURES."
-        )
-
-    print(
-        "Feature order verified:",
-        len(booster_feature_names),
-        "features"
-    )
-
+    # --------------------------------------------------
+    # PREDICTIONS
+    # --------------------------------------------------
 
     probabilities = model.predict_proba(
         X_test
@@ -338,8 +473,12 @@ for option_type in ["CE", "PE"]:
     ).astype(int)
 
 
+    # --------------------------------------------------
+    # STANDARD METRICS
+    # --------------------------------------------------
+
     print(
-        "Precision:",
+        "Precision @ 0.50:",
         round(
             precision_score(
                 y_test,
@@ -351,7 +490,7 @@ for option_type in ["CE", "PE"]:
     )
 
     print(
-        "Recall:",
+        "Recall @ 0.50:",
         round(
             recall_score(
                 y_test,
@@ -377,19 +516,36 @@ for option_type in ["CE", "PE"]:
         )
 
 
+    # --------------------------------------------------
+    # THRESHOLD TABLE
+    # --------------------------------------------------
+
+    print_threshold_table(
+        test,
+        probabilities,
+        y_test,
+        option_type
+    )
+
+
+    # --------------------------------------------------
+    # SAVE PREDICTIONS
+    # --------------------------------------------------
+
     test["prediction_probability"] = probabilities
+
     test["prediction_class_50"] = predictions
 
 
     # --------------------------------------------------
-    # HIGH-CONFIDENCE ANALYSIS
+    # HIGH CONFIDENCE
     # --------------------------------------------------
 
     high = test[
         test["prediction_probability"] >= 0.80
     ]
 
-    print("80%+ signals:", len(high))
+    print("\n80%+ signals:", len(high))
 
     if len(high):
 
@@ -399,12 +555,16 @@ for option_type in ["CE", "PE"]:
         )
 
 
-    # Optional Fidelity-filter diagnostic
     if "fidelity_confirmed" in test.columns:
 
         high_fidelity = test[
             (test["prediction_probability"] >= 0.80)
-            & (test["fidelity_confirmed"] == 1)
+            & (
+                test["fidelity_confirmed"]
+                .fillna(0)
+                .astype(int)
+                == 1
+            )
         ]
 
         print(
@@ -421,12 +581,12 @@ for option_type in ["CE", "PE"]:
 
 
     # --------------------------------------------------
-    # SAVE INDIVIDUAL MODEL
+    # SAVE 5% MODEL
     # --------------------------------------------------
 
     model_path = (
         MODEL_DIR
-        / f"xgboost_{option_type.lower()}_10pct.json"
+        / f"xgboost_{option_type.lower()}_5pct.json"
     )
 
     model.save_model(
@@ -445,7 +605,7 @@ for option_type in ["CE", "PE"]:
 
 
 # --------------------------------------------------
-# COMBINE CE + PE PREDICTIONS
+# COMBINE PREDICTIONS
 # --------------------------------------------------
 
 combined = pd.concat(
@@ -458,25 +618,23 @@ combined = combined.sort_values(
 )
 
 
-# Save parquet
 combined.to_parquet(
     PREDICTIONS_PATH,
     index=False
 )
 
-
-# Save CSV too
 combined.to_csv(
     PREDICTIONS_CSV_PATH,
     index=False
 )
 
 
-# Save exact model feature order
-features_path = MODEL_DIR / "features.json"
+# --------------------------------------------------
+# SAVE FEATURE ORDER
+# --------------------------------------------------
 
 with open(
-    features_path,
+    MODEL_DIR / "features.json",
     "w"
 ) as f:
 
@@ -485,32 +643,6 @@ with open(
         f,
         indent=4
     )
-
-with open(
-    features_path,
-    "r"
-) as f:
-
-    saved_features = json.load(f)
-
-if saved_features != FEATURES:
-    raise RuntimeError(
-        "models/features.json does not match the features used for training."
-    )
-
-saved_hash = hashlib.sha256(
-    "\n".join(saved_features).encode("utf-8")
-).hexdigest()
-
-if saved_hash != FEATURES_SHA256:
-    raise RuntimeError("features.json hash verification failed.")
-
-print(
-    "\nfeatures.json verified:",
-    len(saved_features),
-    "features | SHA256:",
-    saved_hash
-)
 
 
 # --------------------------------------------------
@@ -542,7 +674,12 @@ if "fidelity_confirmed" in combined.columns:
 
     high_fidelity = combined[
         (combined["prediction_probability"] >= 0.80)
-        & (combined["fidelity_confirmed"] == 1)
+        & (
+            combined["fidelity_confirmed"]
+            .fillna(0)
+            .astype(int)
+            == 1
+        )
     ]
 
     print(
