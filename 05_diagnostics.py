@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import hashlib
+import json
 import pandas as pd
 from xgboost import XGBClassifier
 
@@ -20,9 +22,11 @@ BACKTEST_PATH = Path(
     "data/processed/backtest_results.parquet"
 )
 
-MODEL_PATH = Path(
-    "models/xgboost_10pct.json"
-)
+MODEL_DIR = Path("models")
+
+CE_MODEL_PATH = MODEL_DIR / "xgboost_ce_10pct.json"
+PE_MODEL_PATH = MODEL_DIR / "xgboost_pe_10pct.json"
+FEATURES_PATH = MODEL_DIR / "features.json"
 
 CONFIDENCE_THRESHOLD = 0.80
 
@@ -45,14 +49,118 @@ predictions["timestamp"] = pd.to_datetime(
     utc=True
 )
 
-backtest["signal_time"] = pd.to_datetime(
-    backtest["signal_time"],
-    utc=True
-)
+if not backtest.empty:
+    backtest["signal_time"] = pd.to_datetime(
+        backtest["signal_time"],
+        utc=True
+    )
 
 training["date"] = training["timestamp"].dt.date
 predictions["date"] = predictions["timestamp"].dt.date
-backtest["date"] = backtest["signal_time"].dt.date
+
+if not backtest.empty:
+    backtest["date"] = backtest["signal_time"].dt.date
+
+
+# --------------------------------------------------
+# FEATURE MANIFEST VERIFICATION
+# --------------------------------------------------
+
+print("\n================================")
+print("0. FEATURE MANIFEST VERIFICATION")
+print("================================")
+
+if not FEATURES_PATH.exists():
+    raise FileNotFoundError(
+        f"Missing feature manifest: {FEATURES_PATH}"
+    )
+
+with open(FEATURES_PATH, "r") as f:
+    saved_features = json.load(f)
+
+if not isinstance(saved_features, list):
+    raise ValueError(
+        "models/features.json must contain a JSON list."
+    )
+
+if len(saved_features) != len(set(saved_features)):
+    raise ValueError(
+        "Duplicate feature names found in models/features.json."
+    )
+
+missing_training_features = [
+    feature
+    for feature in saved_features
+    if feature not in training.columns
+]
+
+missing_prediction_features = [
+    feature
+    for feature in saved_features
+    if feature not in predictions.columns
+]
+
+if missing_training_features:
+    raise ValueError(
+        "Training dataset is missing features from models/features.json:\n"
+        + "\n".join(
+            f"  - {feature}"
+            for feature in missing_training_features
+        )
+    )
+
+if missing_prediction_features:
+    raise ValueError(
+        "Prediction dataset is missing features from models/features.json:\n"
+        + "\n".join(
+            f"  - {feature}"
+            for feature in missing_prediction_features
+        )
+    )
+
+feature_hash = hashlib.sha256(
+    "\n".join(saved_features).encode("utf-8")
+).hexdigest()
+
+print("Feature count:", len(saved_features))
+print("Feature SHA256:", feature_hash)
+print("Training dataset feature check: PASS")
+print("Prediction dataset feature check: PASS")
+
+
+# --------------------------------------------------
+# LOAD BOTH MODELS + VERIFY FEATURE ORDER
+# --------------------------------------------------
+
+models = {}
+
+for option_type, model_path in {
+    "CE": CE_MODEL_PATH,
+    "PE": PE_MODEL_PATH,
+}.items():
+
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"Missing {option_type} model: {model_path}"
+        )
+
+    model = XGBClassifier()
+    model.load_model(model_path)
+
+    booster_features = model.get_booster().feature_names
+
+    if booster_features != saved_features:
+        raise RuntimeError(
+            f"{option_type} model feature order does not match "
+            "models/features.json."
+        )
+
+    print(
+        f"{option_type} model feature check: PASS "
+        f"({len(booster_features)} features)"
+    )
+
+    models[option_type] = model
 
 
 # --------------------------------------------------
@@ -82,11 +190,14 @@ print(natural)
 
 
 # --------------------------------------------------
-# 2. MODEL SIGNALS >= 80%
+# 2. MODEL SIGNALS >= THRESHOLD
 # --------------------------------------------------
 
 print("\n================================")
-print("2. MODEL SIGNALS >= 80%")
+print(
+    f"2. MODEL SIGNALS >= "
+    f"{CONFIDENCE_THRESHOLD:.0%}"
+)
 print("================================")
 
 signals = predictions[
@@ -117,53 +228,136 @@ print(signal_summary)
 
 
 # --------------------------------------------------
-# 3. REAL BACKTEST BY CE / PE
+# 3. SIGNAL FUNNEL BY CE / PE
 # --------------------------------------------------
 
 print("\n================================")
-print("3. REAL BACKTEST")
+print("3. SIGNAL FUNNEL BY CE / PE")
 print("================================")
 
-trade_summary = (
-    backtest
-    .groupby("instrument_type")
-    .agg(
-        trades=("symbol", "count"),
-
-        targets=(
-            "exit_reason",
-            lambda x: (x == "TARGET").sum()
-        ),
-
-        stops=(
-            "exit_reason",
-            lambda x: x.isin(
-                ["STOP", "STOP_SAME_CANDLE"]
-            ).sum()
-        ),
-
-        avg_return=(
-            "net_return_pct",
-            "mean"
-        )
+def side_count(frame, option_type):
+    return int(
+        (
+            frame["instrument_type"]
+            == option_type
+        ).sum()
     )
+
+stage_conf = predictions[
+    predictions["prediction_probability"]
+    >= CONFIDENCE_THRESHOLD
+].copy()
+
+stage_setup = stage_conf[
+    stage_conf["candidate_setup"] == 1
+].copy()
+
+stage_fidelity = stage_setup[
+    stage_setup["fidelity_confirmed"] == 1
+].copy()
+
+stage_best = (
+    stage_fidelity
+    .sort_values(
+        [
+            "timestamp",
+            "prediction_probability"
+        ],
+        ascending=[True, False]
+    )
+    .groupby(
+        "timestamp",
+        as_index=False
+    )
+    .first()
 )
 
-trade_summary["win_rate"] = (
-    trade_summary["targets"]
-    / trade_summary["trades"]
-    * 100
-)
+for option_type in ["CE", "PE"]:
 
-print(trade_summary)
+    final_trades = (
+        side_count(backtest, option_type)
+        if not backtest.empty
+        else 0
+    )
+
+    print(f"\n{option_type}")
+    print(
+        f"{CONFIDENCE_THRESHOLD:.0%}+ model signals:",
+        side_count(stage_conf, option_type)
+    )
+    print(
+        "After setup filter:",
+        side_count(stage_setup, option_type)
+    )
+    print(
+        "After Fidelity filter:",
+        side_count(stage_fidelity, option_type)
+    )
+    print(
+        "After best-candidate filter:",
+        side_count(stage_best, option_type)
+    )
+    print(
+        "Final backtest trades:",
+        final_trades
+    )
 
 
 # --------------------------------------------------
-# 4. CONFIDENCE CALIBRATION
+# 4. REAL BACKTEST BY CE / PE
 # --------------------------------------------------
 
 print("\n================================")
-print("4. CONFIDENCE CALIBRATION")
+print("4. REAL BACKTEST")
+print("================================")
+
+if backtest.empty:
+
+    print("No backtest trades available.")
+
+else:
+
+    trade_summary = (
+        backtest
+        .groupby("instrument_type")
+        .agg(
+            trades=("symbol", "count"),
+            targets=(
+                "exit_reason",
+                lambda x: (x == "TARGET").sum()
+            ),
+            stops=(
+                "exit_reason",
+                lambda x: x.isin(
+                    ["STOP", "STOP_SAME_CANDLE"]
+                ).sum()
+            ),
+            timeouts=(
+                "exit_reason",
+                lambda x: (x == "TIMEOUT").sum()
+            ),
+            avg_return=(
+                "net_return_pct",
+                "mean"
+            )
+        )
+    )
+
+    trade_summary["win_rate"] = (
+        trade_summary["targets"]
+        / trade_summary["trades"]
+        * 100
+    )
+
+    print(trade_summary)
+
+
+# --------------------------------------------------
+# 5. CONFIDENCE CALIBRATION — CE / PE SEPARATE
+# --------------------------------------------------
+
+print("\n================================")
+print("5. CONFIDENCE CALIBRATION BY SIDE")
 print("================================")
 
 bins = [
@@ -186,7 +380,10 @@ predictions["confidence_band"] = pd.cut(
 calibration = (
     predictions
     .groupby(
-        "confidence_band",
+        [
+            "instrument_type",
+            "confidence_band"
+        ],
         observed=True
     )
     .agg(
@@ -209,276 +406,363 @@ print(calibration)
 
 
 # --------------------------------------------------
-# 5. HIGH CONFIDENCE BACKTEST
+# 6. BACKTEST BY CONFIDENCE + SIDE
 # --------------------------------------------------
 
 print("\n================================")
-print("5. BACKTEST BY CONFIDENCE")
+print("6. BACKTEST BY CONFIDENCE + SIDE")
 print("================================")
 
-backtest["confidence_band"] = pd.cut(
-    backtest["prediction_probability"],
-    bins=[
-        0.80,
-        0.85,
-        0.90,
-        0.95,
-        1.01
-    ],
-    right=False
-)
+if backtest.empty:
 
-bt_confidence = (
-    backtest
-    .groupby(
-        "confidence_band",
-        observed=True
+    print("No backtest trades available.")
+
+else:
+
+    backtest["confidence_band"] = pd.cut(
+        backtest["prediction_probability"],
+        bins=[
+            0.80,
+            0.85,
+            0.90,
+            0.95,
+            1.01
+        ],
+        right=False
     )
-    .agg(
-        trades=("symbol", "count"),
 
-        targets=(
-            "exit_reason",
-            lambda x: (x == "TARGET").sum()
-        ),
-
-        avg_return=(
-            "net_return_pct",
-            "mean"
+    bt_confidence = (
+        backtest
+        .groupby(
+            [
+                "instrument_type",
+                "confidence_band"
+            ],
+            observed=True
+        )
+        .agg(
+            trades=("symbol", "count"),
+            targets=(
+                "exit_reason",
+                lambda x:
+                    (x == "TARGET").sum()
+            ),
+            avg_return=(
+                "net_return_pct",
+                "mean"
+            )
         )
     )
-)
 
-bt_confidence["win_rate"] = (
-    bt_confidence["targets"]
-    / bt_confidence["trades"]
-    * 100
-)
+    bt_confidence["win_rate"] = (
+        bt_confidence["targets"]
+        / bt_confidence["trades"]
+        * 100
+    )
 
-print(bt_confidence)
+    print(bt_confidence)
 
 
 # --------------------------------------------------
-# 6. SIGNAL OVERLAP
+# 7. SIGNAL OVERLAP BY SIDE
 # --------------------------------------------------
 
 print("\n================================")
-print("6. SIGNAL OVERLAP")
+print("7. SIGNAL OVERLAP BY SIDE")
 print("================================")
 
-# How many high-confidence signals occur
-# for same option in same 30-minute period?
+for option_type in ["CE", "PE"]:
 
-signals = signals.sort_values(
-    ["symbol", "timestamp"]
-)
+    side_signals = signals[
+        signals["instrument_type"] == option_type
+    ].sort_values(
+        ["symbol", "timestamp"]
+    )
 
-overlap_counts = []
+    overlap_counts = []
 
-for symbol, group in signals.groupby("symbol"):
+    for _, group in side_signals.groupby("symbol"):
 
-    times = group["timestamp"].tolist()
+        times = group["timestamp"].tolist()
 
-    for timestamp in times:
+        for timestamp in times:
 
-        end = timestamp + pd.Timedelta(
-            minutes=30
+            end = timestamp + pd.Timedelta(
+                minutes=30
+            )
+
+            count = sum(
+                1
+                for t in times
+                if timestamp <= t <= end
+            )
+
+            overlap_counts.append(count)
+
+    print(f"\n{option_type}")
+
+    if overlap_counts:
+
+        overlap_series = pd.Series(
+            overlap_counts
         )
 
-        count = sum(
-            1
-            for t in times
-            if timestamp <= t <= end
+        print(
+            "Average signals inside 30m window:",
+            round(
+                overlap_series.mean(),
+                2
+            )
         )
 
-        overlap_counts.append(count)
+        print(
+            "Median:",
+            round(
+                overlap_series.median(),
+                2
+            )
+        )
 
+        print(
+            "Maximum:",
+            overlap_series.max()
+        )
 
-if overlap_counts:
+    else:
 
-    overlap_series = pd.Series(
-        overlap_counts
-    )
-
-    print(
-        "Average signals inside 30m window:",
-        round(overlap_series.mean(), 2)
-    )
-
-    print(
-        "Median:",
-        round(overlap_series.median(), 2)
-    )
-
-    print(
-        "Maximum:",
-        overlap_series.max()
-    )
+        print("No high-confidence signals.")
 
 
 # --------------------------------------------------
-# 7. SIGNALS PER DAY
+# 8. SIGNALS PER DAY + SIDE
 # --------------------------------------------------
 
 print("\n================================")
-print("7. SIGNALS PER DAY")
+print("8. SIGNALS PER DAY + SIDE")
 print("================================")
 
 daily_signals = (
     signals
-    .groupby("date")
+    .groupby(
+        [
+            "date",
+            "instrument_type"
+        ]
+    )
     .size()
+    .unstack(
+        fill_value=0
+    )
 )
 
 print(daily_signals)
 
-print(
-    "\nAverage signals/day:",
-    round(daily_signals.mean(), 2)
-)
-
 
 # --------------------------------------------------
-# 8. ACTUAL TRADES PER DAY
+# 9. REAL TRADES PER DAY
 # --------------------------------------------------
 
 print("\n================================")
-print("8. REAL TRADES PER DAY")
+print("9. REAL TRADES PER DAY")
 print("================================")
 
-daily_trades = (
-    backtest
-    .groupby("date")
-    .agg(
-        trades=("symbol", "count"),
+if backtest.empty:
 
-        targets=(
-            "exit_reason",
-            lambda x: (x == "TARGET").sum()
-        ),
+    print("No backtest trades available.")
 
-        avg_return=(
-            "net_return_pct",
-            "mean"
+else:
+
+    daily_trades = (
+        backtest
+        .groupby(
+            [
+                "date",
+                "instrument_type"
+            ]
+        )
+        .agg(
+            trades=("symbol", "count"),
+            targets=(
+                "exit_reason",
+                lambda x:
+                    (x == "TARGET").sum()
+            ),
+            avg_return=(
+                "net_return_pct",
+                "mean"
+            )
         )
     )
-)
 
-daily_trades["win_rate"] = (
-    daily_trades["targets"]
-    / daily_trades["trades"]
-    * 100
-)
+    daily_trades["win_rate"] = (
+        daily_trades["targets"]
+        / daily_trades["trades"]
+        * 100
+    )
 
-print(daily_trades)
+    print(daily_trades)
 
 
 # --------------------------------------------------
-# 9. BEST / WORST STRIKES
+# 10. PERFORMANCE BY STRIKE
 # --------------------------------------------------
 
 print("\n================================")
-print("9. PERFORMANCE BY STRIKE")
+print("10. PERFORMANCE BY STRIKE")
 print("================================")
 
-strike_summary = (
-    backtest
-    .groupby(
-        ["instrument_type", "strike"]
-    )
-    .agg(
-        trades=("symbol", "count"),
+if backtest.empty:
 
-        targets=(
-            "exit_reason",
-            lambda x: (x == "TARGET").sum()
-        ),
+    print("No backtest trades available.")
 
-        avg_return=(
-            "net_return_pct",
-            "mean"
+else:
+
+    strike_summary = (
+        backtest
+        .groupby(
+            [
+                "instrument_type",
+                "strike"
+            ]
+        )
+        .agg(
+            trades=("symbol", "count"),
+            targets=(
+                "exit_reason",
+                lambda x:
+                    (x == "TARGET").sum()
+            ),
+            avg_return=(
+                "net_return_pct",
+                "mean"
+            )
         )
     )
-)
 
-strike_summary["win_rate"] = (
-    strike_summary["targets"]
-    / strike_summary["trades"]
-    * 100
-)
-
-print(
-    strike_summary.sort_values(
-        "win_rate",
-        ascending=False
+    strike_summary["win_rate"] = (
+        strike_summary["targets"]
+        / strike_summary["trades"]
+        * 100
     )
-)
+
+    print(
+        strike_summary.sort_values(
+            "win_rate",
+            ascending=False
+        )
+    )
 
 
 # --------------------------------------------------
-# 10. FEATURE IMPORTANCE
+# 11. FEATURE IMPORTANCE — CE / PE SEPARATE
 # --------------------------------------------------
 
 print("\n================================")
-print("10. XGBOOST FEATURE IMPORTANCE")
+print("11. XGBOOST FEATURE IMPORTANCE")
 print("================================")
 
-model = XGBClassifier()
-model.load_model(MODEL_PATH)
+for option_type in ["CE", "PE"]:
 
-booster = model.get_booster()
+    print(f"\n{option_type} TOP 20 FEATURES")
 
-importance = booster.get_score(
-    importance_type="gain"
-)
+    booster = (
+        models[option_type]
+        .get_booster()
+    )
 
-importance_df = pd.DataFrame(
-    list(importance.items()),
-    columns=[
-        "feature",
-        "importance"
+    importance = booster.get_score(
+        importance_type="gain"
+    )
+
+    importance_df = pd.DataFrame(
+        list(importance.items()),
+        columns=[
+            "feature",
+            "importance"
+        ]
+    )
+
+    if importance_df.empty:
+
+        print("No feature importance available.")
+        continue
+
+    importance_df = (
+        importance_df
+        .sort_values(
+            "importance",
+            ascending=False
+        )
+    )
+
+    unknown_features = [
+        feature
+        for feature in importance_df["feature"]
+        if feature not in saved_features
     ]
-)
 
-importance_df = importance_df.sort_values(
-    "importance",
-    ascending=False
-)
+    if unknown_features:
+        raise RuntimeError(
+            f"{option_type} model reports features not present "
+            "in models/features.json: "
+            + ", ".join(unknown_features)
+        )
 
-print(
-    importance_df.head(20).to_string(
-        index=False
+    print(
+        importance_df
+        .head(20)
+        .to_string(
+            index=False
+        )
     )
-)
 
 
 # --------------------------------------------------
 # FINAL SUMMARY
 # --------------------------------------------------
 
-overall_target_rate = (
-    (backtest["exit_reason"] == "TARGET").mean()
-    * 100
-)
-
-overall_avg_return = backtest[
-    "net_return_pct"
-].mean()
-
 print("\n================================")
 print("DIAGNOSTICS COMPLETE")
 print("================================")
 
 print("Training rows:", len(training))
-print("80%+ model signals:", len(signals))
-print("Actual trades:", len(backtest))
-
 print(
-    "Overall backtest target rate:",
-    f"{overall_target_rate:.2f}%"
+    f"{CONFIDENCE_THRESHOLD:.0%}+ model signals:",
+    len(signals)
 )
 
 print(
-    "Overall average return:",
-    f"{overall_avg_return:.2f}%"
+    "Actual trades:",
+    len(backtest)
 )
+
+if backtest.empty:
+
+    print("Overall backtest target rate: N/A")
+    print("Overall average return: N/A")
+
+else:
+
+    overall_target_rate = (
+        (
+            backtest["exit_reason"]
+            == "TARGET"
+        ).mean()
+        * 100
+    )
+
+    overall_avg_return = (
+        backtest[
+            "net_return_pct"
+        ].mean()
+    )
+
+    print(
+        "Overall backtest target rate:",
+        f"{overall_target_rate:.2f}%"
+    )
+
+    print(
+        "Overall average return:",
+        f"{overall_avg_return:.2f}%"
+    )

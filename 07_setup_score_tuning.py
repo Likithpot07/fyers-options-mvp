@@ -1,20 +1,54 @@
 from pathlib import Path
+
 import pandas as pd
 
-PREDICTIONS_PATH = Path("data/processed/test_predictions.parquet")
-RAW_PATH = Path("data/raw/candles_1m.parquet")
 
-CONFIDENCE = 0.85
+# --------------------------------------------------
+# CONFIG
+# --------------------------------------------------
+
+PREDICTIONS_PATH = Path(
+    "data/processed/test_predictions.parquet"
+)
+
+RAW_PATH = Path(
+    "data/raw/candles_1m.parquet"
+)
 
 TARGET_PCT = 0.10
-STOP_PCT = 0.05
+STOP_PCT = 0.10
 MAX_HOLD_MINUTES = 30
 
-SETUP_THRESHOLDS = [4, 5, 6, 7, 8]
+CONFIDENCE_THRESHOLDS = [
+    0.75,
+    0.80,
+    0.85,
+    0.90,
+]
+
+SETUP_THRESHOLDS = [
+    0,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+]
 
 
-predictions = pd.read_parquet(PREDICTIONS_PATH)
-raw = pd.read_parquet(RAW_PATH)
+# --------------------------------------------------
+# LOAD
+# --------------------------------------------------
+
+predictions = pd.read_parquet(
+    PREDICTIONS_PATH
+)
+
+raw = pd.read_parquet(
+    RAW_PATH
+)
 
 predictions["timestamp"] = pd.to_datetime(
     predictions["timestamp"],
@@ -27,45 +61,85 @@ raw["timestamp"] = pd.to_datetime(
 )
 
 raw = raw[
-    raw["instrument_type"] == "PE"
+    raw["instrument_type"].isin(
+        ["CE", "PE"]
+    )
 ].copy()
 
 raw_by_symbol = {
-    symbol: group.sort_values(
-        "timestamp"
-    ).reset_index(drop=True)
-    for symbol, group in raw.groupby("symbol")
+    symbol: (
+        group
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+    for symbol, group
+    in raw.groupby("symbol")
 }
 
 
-def run_backtest(min_setup_score):
+# --------------------------------------------------
+# BACKTEST
+# --------------------------------------------------
+
+def run_backtest(
+    option_type,
+    confidence,
+    min_setup_score,
+    require_fidelity=False,
+):
 
     signals = predictions[
-        (predictions["instrument_type"] == "PE")
-        & (predictions["prediction_probability"] >= CONFIDENCE)
-        & (predictions["setup_score"] >= min_setup_score)
+        (predictions["instrument_type"] == option_type)
+        & (
+            predictions["prediction_probability"]
+            >= confidence
+        )
+        & (
+            predictions["setup_score"]
+            >= min_setup_score
+        )
     ].copy()
 
-    # Best candidate each minute
+    if require_fidelity:
+        signals = signals[
+            signals["fidelity_confirmed"] == 1
+        ].copy()
+
+    raw_signal_count = len(signals)
+
+    # Best candidate for this side at each minute
     signals = (
         signals
         .sort_values(
-            ["timestamp", "prediction_probability"],
+            [
+                "timestamp",
+                "prediction_probability"
+            ],
             ascending=[True, False]
         )
-        .groupby("timestamp", as_index=False)
+        .groupby(
+            "timestamp",
+            as_index=False
+        )
         .first()
     )
 
+    best_candidate_count = len(signals)
+
     trades = []
     last_exit = None
+    overlap_rejected = 0
 
     for _, signal in signals.iterrows():
 
         signal_time = signal["timestamp"]
         symbol = signal["symbol"]
 
-        if last_exit is not None and signal_time <= last_exit:
+        if (
+            last_exit is not None
+            and signal_time <= last_exit
+        ):
+            overlap_rejected += 1
             continue
 
         if symbol not in raw_by_symbol:
@@ -74,7 +148,8 @@ def run_backtest(min_setup_score):
         candles = raw_by_symbol[symbol]
 
         future = candles[
-            candles["timestamp"] > signal_time
+            candles["timestamp"]
+            > signal_time
         ]
 
         if future.empty:
@@ -82,37 +157,65 @@ def run_backtest(min_setup_score):
 
         entry = future.iloc[0]
 
-        if entry["timestamp"].date() != signal_time.date():
+        if (
+            entry["timestamp"].date()
+            != signal_time.date()
+        ):
             continue
 
         entry_time = entry["timestamp"]
         entry_price = entry["open"]
 
-        target = entry_price * 1.10
-        stop = entry_price * 0.95
+        target = (
+            entry_price
+            * (1 + TARGET_PCT)
+        )
+
+        stop = (
+            entry_price
+            * (1 - STOP_PCT)
+        )
 
         end_time = (
             entry_time
-            + pd.Timedelta(minutes=MAX_HOLD_MINUTES)
+            + pd.Timedelta(
+                minutes=MAX_HOLD_MINUTES
+            )
         )
 
         trade_candles = candles[
             (candles["timestamp"] >= entry_time)
             & (candles["timestamp"] <= end_time)
+            & (
+                candles["timestamp"].dt.date
+                == entry_time.date()
+            )
         ]
 
         if trade_candles.empty:
             continue
 
         outcome = "TIMEOUT"
-
-        exit_price = trade_candles.iloc[-1]["close"]
-        exit_time = trade_candles.iloc[-1]["timestamp"]
+        exit_price = (
+            trade_candles
+            .iloc[-1]["close"]
+        )
+        exit_time = (
+            trade_candles
+            .iloc[-1]["timestamp"]
+        )
 
         for _, candle in trade_candles.iterrows():
 
-            target_hit = candle["high"] >= target
-            stop_hit = candle["low"] <= stop
+            target_hit = (
+                candle["high"]
+                >= target
+            )
+
+            stop_hit = (
+                candle["low"]
+                <= stop
+            )
 
             if target_hit and stop_hit:
                 outcome = "STOP"
@@ -133,45 +236,216 @@ def run_backtest(min_setup_score):
                 break
 
         return_pct = (
-            (exit_price - entry_price)
+            (
+                exit_price
+                - entry_price
+            )
             / entry_price
             * 100
         )
 
-        trades.append({
-            "outcome": outcome,
-            "return_pct": return_pct
-        })
+        trades.append(
+            {
+                "outcome": outcome,
+                "return_pct": return_pct
+            }
+        )
 
         last_exit = exit_time
 
     if not trades:
-        return min_setup_score, 0, 0, 0
+
+        return {
+            "option_type": option_type,
+            "confidence": confidence,
+            "setup_score": min_setup_score,
+            "fidelity": require_fidelity,
+            "raw_signals": raw_signal_count,
+            "best_candidates": best_candidate_count,
+            "overlap_rejected": overlap_rejected,
+            "trades": 0,
+            "wins": 0,
+            "win_rate": 0.0,
+            "avg_return": 0.0,
+        }
 
     trades = pd.DataFrame(trades)
 
-    win_rate = (
-        (trades["outcome"] == "TARGET").mean()
-        * 100
+    wins = int(
+        (
+            trades["outcome"]
+            == "TARGET"
+        ).sum()
     )
 
-    return (
-        min_setup_score,
-        len(trades),
-        win_rate,
-        trades["return_pct"].mean()
-    )
+    return {
+        "option_type": option_type,
+        "confidence": confidence,
+        "setup_score": min_setup_score,
+        "fidelity": require_fidelity,
+        "raw_signals": raw_signal_count,
+        "best_candidates": best_candidate_count,
+        "overlap_rejected": overlap_rejected,
+        "trades": len(trades),
+        "wins": wins,
+        "win_rate": (
+            wins
+            / len(trades)
+            * 100
+        ),
+        "avg_return": (
+            trades["return_pct"].mean()
+        ),
+    }
 
 
-print("\nSETUP SCORE RESULTS\n")
+# --------------------------------------------------
+# RUN GRID
+# --------------------------------------------------
 
-for score in SETUP_THRESHOLDS:
+rows = []
 
-    score, trades, win_rate, avg_return = run_backtest(score)
+for option_type in ["CE", "PE"]:
 
-    print(
-        f"Score >= {score} | "
-        f"Trades: {trades} | "
-        f"Win Rate: {win_rate:.2f}% | "
-        f"Avg Return: {avg_return:.2f}%"
-    )
+    for confidence in CONFIDENCE_THRESHOLDS:
+
+        for setup_score in SETUP_THRESHOLDS:
+
+            rows.append(
+                run_backtest(
+                    option_type=option_type,
+                    confidence=confidence,
+                    min_setup_score=setup_score,
+                    require_fidelity=False,
+                )
+            )
+
+results = pd.DataFrame(rows)
+
+
+# --------------------------------------------------
+# PRINT — NO FIDELITY
+# --------------------------------------------------
+
+print("\n================================")
+print("SETUP SCORE TUNING — NO FIDELITY")
+print("================================")
+
+for option_type in ["CE", "PE"]:
+
+    for confidence in CONFIDENCE_THRESHOLDS:
+
+        print(
+            f"\n{option_type} | "
+            f"Confidence >= {confidence:.2f}"
+        )
+
+        side = results[
+            (results["option_type"] == option_type)
+            & (
+                results["confidence"]
+                == confidence
+            )
+        ]
+
+        print(
+            side[
+                [
+                    "setup_score",
+                    "raw_signals",
+                    "best_candidates",
+                    "trades",
+                    "wins",
+                    "win_rate",
+                    "avg_return",
+                ]
+            ]
+            .to_string(
+                index=False,
+                formatters={
+                    "win_rate":
+                        lambda x: f"{x:.2f}%",
+                    "avg_return":
+                        lambda x: f"{x:.2f}%",
+                }
+            )
+        )
+
+
+# --------------------------------------------------
+# FIDELITY CHECK AT BEST-USEFUL CONFIDENCES
+# --------------------------------------------------
+
+print("\n================================")
+print("FIDELITY COMPARISON")
+print("================================")
+
+fidelity_rows = []
+
+for option_type in ["CE", "PE"]:
+
+    for confidence in [0.80, 0.85]:
+
+        for setup_score in SETUP_THRESHOLDS:
+
+            fidelity_rows.append(
+                run_backtest(
+                    option_type=option_type,
+                    confidence=confidence,
+                    min_setup_score=setup_score,
+                    require_fidelity=True,
+                )
+            )
+
+fidelity_results = pd.DataFrame(
+    fidelity_rows
+)
+
+for option_type in ["CE", "PE"]:
+
+    for confidence in [0.80, 0.85]:
+
+        print(
+            f"\n{option_type} | "
+            f"Confidence >= {confidence:.2f} | "
+            "Fidelity required"
+        )
+
+        side = fidelity_results[
+            (
+                fidelity_results["option_type"]
+                == option_type
+            )
+            & (
+                fidelity_results["confidence"]
+                == confidence
+            )
+        ]
+
+        print(
+            side[
+                [
+                    "setup_score",
+                    "raw_signals",
+                    "best_candidates",
+                    "trades",
+                    "wins",
+                    "win_rate",
+                    "avg_return",
+                ]
+            ]
+            .to_string(
+                index=False,
+                formatters={
+                    "win_rate":
+                        lambda x: f"{x:.2f}%",
+                    "avg_return":
+                        lambda x: f"{x:.2f}%",
+                }
+            )
+        )
+
+
+print("\n================================")
+print("SETUP SCORE TUNING COMPLETE")
+print("================================")

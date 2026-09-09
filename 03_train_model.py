@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import hashlib
 import json
 import pandas as pd
 from xgboost import XGBClassifier
@@ -124,6 +125,22 @@ FEATURES = [
 ]
 
 TARGET = "target_hit"
+
+# --------------------------------------------------
+# FEATURE MANIFEST / INTEGRITY CHECKS
+# --------------------------------------------------
+if len(FEATURES) != len(set(FEATURES)):
+    raise ValueError("Duplicate feature names found in FEATURES.")
+
+FEATURES_SHA256 = hashlib.sha256(
+    "\n".join(FEATURES).encode("utf-8")
+).hexdigest()
+
+print("\nMODEL FEATURE MANIFEST")
+print("----------------------------")
+print("Feature count:", len(FEATURES))
+print("Feature SHA256:", FEATURES_SHA256)
+print("----------------------------")
 
 
 # --------------------------------------------------
@@ -298,6 +315,19 @@ for option_type in ["CE", "PE"]:
         y_train
     )
 
+    booster_feature_names = model.get_booster().feature_names
+
+    if booster_feature_names != FEATURES:
+        raise RuntimeError(
+            f"{option_type} model feature order does not match FEATURES."
+        )
+
+    print(
+        "Feature order verified:",
+        len(booster_feature_names),
+        "features"
+    )
+
 
     probabilities = model.predict_proba(
         X_test
@@ -443,8 +473,10 @@ combined.to_csv(
 
 
 # Save exact model feature order
+features_path = MODEL_DIR / "features.json"
+
 with open(
-    MODEL_DIR / "features.json",
+    features_path,
     "w"
 ) as f:
 
@@ -453,6 +485,32 @@ with open(
         f,
         indent=4
     )
+
+with open(
+    features_path,
+    "r"
+) as f:
+
+    saved_features = json.load(f)
+
+if saved_features != FEATURES:
+    raise RuntimeError(
+        "models/features.json does not match the features used for training."
+    )
+
+saved_hash = hashlib.sha256(
+    "\n".join(saved_features).encode("utf-8")
+).hexdigest()
+
+if saved_hash != FEATURES_SHA256:
+    raise RuntimeError("features.json hash verification failed.")
+
+print(
+    "\nfeatures.json verified:",
+    len(saved_features),
+    "features | SHA256:",
+    saved_hash
+)
 
 
 # --------------------------------------------------
