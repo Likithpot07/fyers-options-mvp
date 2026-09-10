@@ -26,7 +26,7 @@ API_BASE = "https://api.upstox.com"
 UNDERLYING = "NSE_INDEX|Nifty 50"
 
 START_DATE = "2026-08-01"
-END_DATE = "2026-08-15"
+END_DATE = "2026-09-01"
 
 STRIKES_EACH_SIDE = 5
 
