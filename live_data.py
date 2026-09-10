@@ -39,14 +39,20 @@ PE_MODEL_10PCT_PATH = Path("models/xgboost_pe_10pct.json")
 CE_MODEL_5PCT_PATH = Path("models/xgboost_ce_5pct.json")
 PE_MODEL_5PCT_PATH = Path("models/xgboost_pe_5pct.json")
 
-# Keep thresholds separate so they can be tuned independently later.
-CONFIDENCE_THRESHOLD_10PCT = 0.85
-CONFIDENCE_THRESHOLD_5PCT = 0.85
+# Test the same live confidence thresholds used in historical validation.
+# Probabilities are calculated once; the same score is evaluated against both.
+CONFIDENCE_THRESHOLDS_10PCT = (0.80, 0.85)
+CONFIDENCE_THRESHOLDS_5PCT = (0.80, 0.85)
+
+CONFIDENCE_THRESHOLD_10PCT_80 = CONFIDENCE_THRESHOLDS_10PCT[0]
+CONFIDENCE_THRESHOLD_10PCT_85 = CONFIDENCE_THRESHOLDS_10PCT[1]
+CONFIDENCE_THRESHOLD_5PCT_80 = CONFIDENCE_THRESHOLDS_5PCT[0]
+CONFIDENCE_THRESHOLD_5PCT_85 = CONFIDENCE_THRESHOLDS_5PCT[1]
 
 SETUP_SCORE_THRESHOLD = 6
 
 TARGET_PCT_10PCT = 0.10
-STOP_PCT_10PCT = 0.10
+STOP_PCT_10PCT = 0.05
 
 TARGET_PCT_5PCT = 0.05
 STOP_PCT_5PCT = 0.05
@@ -347,11 +353,18 @@ PREDICTION_FIELDS = [
     "time_to_expiry_minutes",
     "time_to_expiry_days",
 
-    "approved_10pct",
-    "approved_5pct",
+    "approved_10pct_80",
+    "approved_10pct_85",
+    "approved_5pct_80",
+    "approved_5pct_85",
 
+    # One unique selected signal per strategy. A >=0.85 signal also belongs
+    # to the >=0.80 analysis cohort, but it is never emitted twice.
     "selected_10pct",
     "selected_5pct",
+
+    "threshold_bucket_10pct",
+    "threshold_bucket_5pct",
 
     "signal_10pct",
     "signal_5pct",
@@ -364,8 +377,10 @@ PREDICTION_FIELDS = [
     "target_5pct",
     "stop_5pct",
 
-    "confidence_threshold_10pct",
-    "confidence_threshold_5pct",
+    "confidence_threshold_10pct_80",
+    "confidence_threshold_10pct_85",
+    "confidence_threshold_5pct_80",
+    "confidence_threshold_5pct_85",
     "setup_score_threshold",
 ]
 
@@ -622,11 +637,17 @@ def save_prediction(minute, prediction):
                 "",
             ),
 
-            "approved_10pct": prediction[
-                "approved_10pct"
+            "approved_10pct_80": prediction[
+                "approved_10pct_80"
             ],
-            "approved_5pct": prediction[
-                "approved_5pct"
+            "approved_10pct_85": prediction[
+                "approved_10pct_85"
+            ],
+            "approved_5pct_80": prediction[
+                "approved_5pct_80"
+            ],
+            "approved_5pct_85": prediction[
+                "approved_5pct_85"
             ],
 
             "selected_10pct": prediction.get(
@@ -636,6 +657,15 @@ def save_prediction(minute, prediction):
             "selected_5pct": prediction.get(
                 "selected_5pct",
                 False,
+            ),
+
+            "threshold_bucket_10pct": prediction.get(
+                "threshold_bucket_10pct",
+                "NO_TRADE",
+            ),
+            "threshold_bucket_5pct": prediction.get(
+                "threshold_bucket_5pct",
+                "NO_TRADE",
             ),
 
             "signal_10pct": signal_10pct,
@@ -657,11 +687,17 @@ def save_prediction(minute, prediction):
                 "stop_5pct"
             ],
 
-            "confidence_threshold_10pct": (
-                CONFIDENCE_THRESHOLD_10PCT
+            "confidence_threshold_10pct_80": (
+                CONFIDENCE_THRESHOLD_10PCT_80
             ),
-            "confidence_threshold_5pct": (
-                CONFIDENCE_THRESHOLD_5PCT
+            "confidence_threshold_10pct_85": (
+                CONFIDENCE_THRESHOLD_10PCT_85
+            ),
+            "confidence_threshold_5pct_80": (
+                CONFIDENCE_THRESHOLD_5PCT_80
+            ),
+            "confidence_threshold_5pct_85": (
+                CONFIDENCE_THRESHOLD_5PCT_85
             ),
             "setup_score_threshold": (
                 SETUP_SCORE_THRESHOLD
@@ -1082,11 +1118,11 @@ session_path.write_text(
                 PE_MODEL_5PCT_PATH
             ),
 
-            "confidence_threshold_10pct": (
-                CONFIDENCE_THRESHOLD_10PCT
+            "confidence_thresholds_10pct": list(
+                CONFIDENCE_THRESHOLDS_10PCT
             ),
-            "confidence_threshold_5pct": (
-                CONFIDENCE_THRESHOLD_5PCT
+            "confidence_thresholds_5pct": list(
+                CONFIDENCE_THRESHOLDS_5PCT
             ),
 
             "setup_score_threshold": (
@@ -1560,20 +1596,51 @@ def try_prediction(minute):
             )
         )
 
-        approved_10pct = (
-            probability_10pct
-            >= CONFIDENCE_THRESHOLD_10PCT
-            and setup_score
-            >= SETUP_SCORE_THRESHOLD
+        base_conditions_pass = (
+            setup_score >= SETUP_SCORE_THRESHOLD
             and fidelity_confirmed == 1
         )
 
-        approved_5pct = (
-            probability_5pct
-            >= CONFIDENCE_THRESHOLD_5PCT
-            and setup_score
-            >= SETUP_SCORE_THRESHOLD
-            and fidelity_confirmed == 1
+        # Historical-style threshold cohorts.
+        # >=0.85 intentionally also passes >=0.80 for analysis.
+        approved_10pct_80 = (
+            base_conditions_pass
+            and probability_10pct
+            >= CONFIDENCE_THRESHOLD_10PCT_80
+        )
+        approved_10pct_85 = (
+            base_conditions_pass
+            and probability_10pct
+            >= CONFIDENCE_THRESHOLD_10PCT_85
+        )
+
+        approved_5pct_80 = (
+            base_conditions_pass
+            and probability_5pct
+            >= CONFIDENCE_THRESHOLD_5PCT_80
+        )
+        approved_5pct_85 = (
+            base_conditions_pass
+            and probability_5pct
+            >= CONFIDENCE_THRESHOLD_5PCT_85
+        )
+
+        # Mutually exclusive bucket used for the one live signal we display.
+        # This avoids duplicate live signals when probability >= 0.85.
+        threshold_bucket_10pct = (
+            "85_PLUS"
+            if approved_10pct_85
+            else "80_ONLY"
+            if approved_10pct_80
+            else "NO_TRADE"
+        )
+
+        threshold_bucket_5pct = (
+            "85_PLUS"
+            if approved_5pct_85
+            else "80_ONLY"
+            if approved_5pct_80
+            else "NO_TRADE"
         )
 
         prediction = {
@@ -1652,11 +1719,24 @@ def try_prediction(minute):
                 stop_5pct
             ),
 
-            "approved_10pct": (
-                approved_10pct
+            "approved_10pct_80": (
+                approved_10pct_80
             ),
-            "approved_5pct": (
-                approved_5pct
+            "approved_10pct_85": (
+                approved_10pct_85
+            ),
+            "approved_5pct_80": (
+                approved_5pct_80
+            ),
+            "approved_5pct_85": (
+                approved_5pct_85
+            ),
+
+            "threshold_bucket_10pct": (
+                threshold_bucket_10pct
+            ),
+            "threshold_bucket_5pct": (
+                threshold_bucket_5pct
             ),
 
             "selected_10pct": False,
@@ -1674,12 +1754,15 @@ def try_prediction(minute):
     if not predictions_this_minute:
         return
 
+    # Select only ONE CE/PE signal per strategy using the >=0.80 candidate
+    # pool. If the winning probability is >=0.85 it is tagged 85_PLUS,
+    # rather than creating a duplicate 0.80 + 0.85 live signal.
     approved_predictions_10pct = [
         prediction
         for prediction
         in predictions_this_minute
         if prediction[
-            "approved_10pct"
+            "approved_10pct_80"
         ]
     ]
 
@@ -1688,7 +1771,7 @@ def try_prediction(minute):
         for prediction
         in predictions_this_minute
         if prediction[
-            "approved_5pct"
+            "approved_5pct_80"
         ]
     ]
 
@@ -1755,11 +1838,12 @@ def try_prediction(minute):
             f"{'MODEL':<10}"
             f"{'SIGNAL':<12}"
             f"{'PROBABILITY':>14}"
+            f"{'BUCKET':>12}"
             f"{'TARGET':>12}"
             f"{'STOP':>12}"
         )
         print(
-            "-" * 60
+            "-" * 72
         )
 
         if latest_signal_10pct:
@@ -1772,6 +1856,7 @@ def try_prediction(minute):
                 f"{'10PCT':<10}"
                 f"{signal_10:<12}"
                 f"{latest_signal_10pct['probability_10pct'] * 100:>13.2f}%"
+                f"{latest_signal_10pct['threshold_bucket_10pct']:>12}"
                 f"{latest_signal_10pct['target_10pct']:>12.2f}"
                 f"{latest_signal_10pct['stop_10pct']:>12.2f}"
             )
@@ -1780,6 +1865,7 @@ def try_prediction(minute):
                 f"{'10PCT':<10}"
                 f"{'NO TRADE':<12}"
                 f"{'-':>14}"
+                f"{'-':>12}"
                 f"{'-':>12}"
                 f"{'-':>12}"
             )
@@ -1794,6 +1880,7 @@ def try_prediction(minute):
                 f"{'5PCT':<10}"
                 f"{signal_5:<12}"
                 f"{latest_signal_5pct['probability_5pct'] * 100:>13.2f}%"
+                f"{latest_signal_5pct['threshold_bucket_5pct']:>12}"
                 f"{latest_signal_5pct['target_5pct']:>12.2f}"
                 f"{latest_signal_5pct['stop_5pct']:>12.2f}"
             )
@@ -1802,6 +1889,7 @@ def try_prediction(minute):
                 f"{'5PCT':<10}"
                 f"{'NO TRADE':<12}"
                 f"{'-':>14}"
+                f"{'-':>12}"
                 f"{'-':>12}"
                 f"{'-':>12}"
             )
@@ -1998,6 +2086,42 @@ def show_dashboard():
                 f"{pe_prediction['probability_5pct'] * 100:>13.2f}%"
             )
 
+        # Show whether each model's best current side passes the two
+        # historical-validation thresholds, without emitting duplicate signals.
+        if latest_signal_10pct:
+            pass_10_80 = "YES"
+            pass_10_85 = (
+                "YES"
+                if latest_signal_10pct["approved_10pct_85"]
+                else "NO"
+            )
+        else:
+            pass_10_80 = "NO"
+            pass_10_85 = "NO"
+
+        if latest_signal_5pct:
+            pass_5_80 = "YES"
+            pass_5_85 = (
+                "YES"
+                if latest_signal_5pct["approved_5pct_85"]
+                else "NO"
+            )
+        else:
+            pass_5_80 = "NO"
+            pass_5_85 = "NO"
+
+        print()
+        print(
+            f"{'Pass >= 0.80':<22}"
+            f"{pass_10_80:>14}"
+            f"{pass_5_80:>14}"
+        )
+        print(
+            f"{'Pass >= 0.85':<22}"
+            f"{pass_10_85:>14}"
+            f"{pass_5_85:>14}"
+        )
+
         # Setup/Fidelity are shared because both models are being
         # evaluated on the same feature row/candle.
         setup_source = (
@@ -2036,6 +2160,23 @@ def show_dashboard():
             f"{'Signal':<22}"
             f"{signal_10:>14}"
             f"{signal_5:>14}"
+        )
+
+        bucket_10 = (
+            latest_signal_10pct["threshold_bucket_10pct"]
+            if latest_signal_10pct
+            else "-"
+        )
+        bucket_5 = (
+            latest_signal_5pct["threshold_bucket_5pct"]
+            if latest_signal_5pct
+            else "-"
+        )
+
+        print(
+            f"{'Threshold bucket':<22}"
+            f"{bucket_10:>14}"
+            f"{bucket_5:>14}"
         )
 
         price_10 = (
@@ -2600,4 +2741,22 @@ upstox_streamer.auto_reconnect(
     20,
 )
 
-upstox_streamer.connect()
+try:
+    upstox_streamer.connect()
+
+except KeyboardInterrupt:
+    print("\nCtrl+C received. Shutting down...")
+
+    try:
+        upstox_streamer.auto_reconnect(False)
+    except Exception:
+        pass
+
+    try:
+        upstox_streamer.disconnect()
+    except Exception:
+        pass
+
+    close_loggers()
+
+    print("Stopped.")
